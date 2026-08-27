@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS bookings (
   date TEXT NOT NULL,      -- YYYY-MM-DD
   time TEXT NOT NULL,      -- HH:MM
   status TEXT DEFAULT 'confirmed', -- confirmed | cancelled
-  reminder_sent INTEGER DEFAULT 0,
+  reminder_sent INTEGER DEFAULT 0,     -- напоминание за 24ч
+  reminder_2h_sent INTEGER DEFAULT 0,  -- напоминание за 2ч
   created_at TEXT DEFAULT (datetime('now')),
   FOREIGN KEY (service_id) REFERENCES services(id)
 );
@@ -38,13 +39,22 @@ CREATE TABLE IF NOT EXISTS user_lang (
 );
 `);
 
+// Миграция: если база уже существовала до добавления reminder_2h_sent — добавляем столбец
+try {
+  db.exec('ALTER TABLE bookings ADD COLUMN reminder_2h_sent INTEGER DEFAULT 0');
+} catch (e) {
+  // столбец уже существует — это нормально, ничего не делаем
+}
+
 // --- Услуги по умолчанию (мастер сможет поменять) ---
 const seedServices = db.prepare('SELECT COUNT(*) as c FROM services').get();
 if (seedServices.c === 0) {
   const insert = db.prepare('INSERT INTO services (name, duration_min, price) VALUES (?, ?, ?)');
-  insert.run('Стрижка мужская', 30, '50 zł');
-  insert.run('Стрижка + борода', 45, '70 zł');
-  insert.run('Окрашивание', 90, '150 zł');
+  insert.run('Strzyżenie damskie krótkie', 60, '90 zł');
+  insert.run('Strzyżenie damskie długie', 60, '130 zł');
+  insert.run('Strzyżenie męskie', 30, '50 zł');
+  insert.run('Modelowanie włosów', 30, '80 zł');
+  insert.run('Koloryzacja (odrosty)', 110, '190 zł');
 }
 
 // --- Рабочие часы (мастер может поменять в config.js) ---
@@ -129,14 +139,22 @@ module.exports = {
     db.prepare("UPDATE bookings SET status = 'cancelled' WHERE id = ?").run(id);
   },
 
-  getBookingsNeedingReminder(dateStr) {
+  // Все подтверждённые записи на ближайшие пару дней — для проверки напоминаний
+  getBookingsForReminderCheck() {
     return db.prepare(`
       SELECT * FROM bookings
-      WHERE date = ? AND status = 'confirmed' AND reminder_sent = 0
-    `).all(dateStr);
+      WHERE status = 'confirmed'
+        AND date >= date('now')
+        AND date <= date('now', '+2 days')
+        AND (reminder_sent = 0 OR reminder_2h_sent = 0)
+    `).all();
   },
 
-  markReminderSent(id) {
+  markReminder24hSent(id) {
     db.prepare('UPDATE bookings SET reminder_sent = 1 WHERE id = ?').run(id);
-  }
+  },
+
+  markReminder2hSent(id) {
+    db.prepare('UPDATE bookings SET reminder_2h_sent = 1 WHERE id = ?').run(id);
+  },
 };
