@@ -8,8 +8,10 @@ const T = {
   welcome: (name) =>
     `👋 Dzień dobry! Pomogę Ci umówić wizytę w *${name}* — szybko, bez dzwonienia.\n\n` +
     `1️⃣ Umów wizytę\n` +
-    `2️⃣ Moje wizyty\n\n` +
-    `_Wyślij cyfrę. Napisz "menu", aby tu wrócić._`,
+    `2️⃣ Moje wizyty\n` +
+    `3️⃣ Anuluj wizytę\n\n` +
+    `_Wyślij cyfrę. Napisz "menu", aby tu wrócić._\n\n` +
+    `📞 W sprawach niestandardowych: ${config.contactPhoneDisplay}`,
   chooseService: '💈 *Wybierz usługę:*',
   sendNumber: '_Wyślij numer z listy_',
   notUnderstood: 'Nie zrozumiałam 🙂',
@@ -60,25 +62,42 @@ function getAvailableDates() {
   return dates;
 }
 
-function generateSlotsForDate(dateStr, excludeBookingId = null) {
+function toMinutes(hhmm) {
+  const [h, m] = hhmm.split(':').map(Number);
+  return h * 60 + m;
+}
+
+function toHHMM(totalMin) {
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+function generateSlotsForDate(dateStr, durationMin, excludeBookingId = null) {
   const weekday = new Date(dateStr + 'T00:00:00').getDay();
   const hours = config.workingHours[weekday];
   if (!hours) return [];
 
-  const slots = [];
-  let [h, m] = hours.start.split(':').map(Number);
-  const [endH, endM] = hours.end.split(':').map(Number);
+  const startMin = toMinutes(hours.start);
+  const endMin = toMinutes(hours.end);
 
-  while (h < endH || (h === endH && m < endM)) {
-    slots.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
-    m += config.slotStepMinutes;
-    if (m >= 60) { m -= 60; h += 1; }
-  }
-
-  const booked = store.getBookingsForDate(dateStr)
+  // Занятые интервалы — с учётом длительности услуги КАЖДОЙ существующей записи
+  const occupied = store.getBookingsForDate(dateStr)
     .filter(b => b.id !== excludeBookingId)
-    .map(b => b.time);
-  return slots.filter(s => !booked.includes(s));
+    .map(b => {
+      const svc = store.getServiceById(b.service_id);
+      const dur = svc ? svc.duration_min : config.slotStepMinutes;
+      const s = toMinutes(b.time);
+      return [s, s + dur];
+    });
+
+  const slots = [];
+  for (let t = startMin; t + durationMin <= endMin; t += config.slotStepMinutes) {
+    const slotEnd = t + durationMin;
+    const overlaps = occupied.some(([os, oe]) => t < oe && slotEnd > os);
+    if (!overlaps) slots.push(toHHMM(t));
+  }
+  return slots;
 }
 
 function buildScheduleText() {
@@ -138,6 +157,8 @@ function handleMessage(phone, rawText) {
       return handleAskName(phone, text, data);
     case 'my_bookings_select':
       return handleMyBookingsSelect(phone, text, data);
+    case 'quick_cancel_select':
+      return handleQuickCancel(phone, text, data);
     case 'booking_action':
       return handleBookingAction(phone, text, data);
     case 'reschedule_choose_date':
@@ -178,7 +199,44 @@ function handleMenu(phone, text) {
     return msg;
   }
 
+  if (text === '3') {
+    const bookings = store.getUpcomingBookingsByPhone(phone);
+    if (bookings.length === 0) {
+      store.resetState(phone);
+      return `${T.noBookings}\n\n` + T.welcome(config.businessName);
+    }
+    let msg = `❌ *Którą wizytę anulować?*\n\n`;
+    bookings.forEach((b, i) => {
+      const service = store.getServiceById(b.service_id);
+      msg += `${i + 1}️⃣ ${formatDateHuman(b.date)} — ${b.time} — ${service ? service.name : ''}\n`;
+    });
+    msg += `\n${T.sendNumber}`;
+    store.setState(phone, 'quick_cancel_select', { bookingIds: bookings.map(b => b.id) });
+    return msg;
+  }
+
   return `${T.notUnderstood}\n\n` + T.welcome(config.businessName);
+}
+
+function handleQuickCancel(phone, text, data) {
+  const idx = parseInt(text, 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= data.bookingIds.length) return T.invalidNumber;
+  const booking = store.getBookingById(data.bookingIds[idx]);
+  if (!booking) {
+    store.resetState(phone);
+    return T.welcome(config.businessName);
+  }
+  const service = store.getServiceById(booking.service_id);
+  store.cancelBooking(booking.id);
+  store.resetState(phone);
+
+  notifyAdmin(
+    `⚠️ *Отмена записи*\n\n` +
+    `${booking.client_name || 'Клиент'}\n${service ? service.name : ''}\n` +
+    `${formatDateHuman(booking.date)} в ${booking.time}`
+  );
+
+  return `${T.cancelled}\n\n` + T.welcome(config.businessName);
 }
 
 function handleChooseService(phone, text, data) {
@@ -197,7 +255,9 @@ function handleChooseDate(phone, text, data) {
   const idx = parseInt(text, 10) - 1;
   if (isNaN(idx) || idx < 0 || idx >= data.dates.length) return T.invalidNumber;
   const date = data.dates[idx];
-  const slots = generateSlotsForDate(date);
+  const service = store.getServiceById(data.serviceId);
+  const duration = service ? service.duration_min : config.slotStepMinutes;
+  const slots = generateSlotsForDate(date, duration);
   if (slots.length === 0) return T.noSlots(formatDateHuman(date));
   let msg = `${T.chooseTime(formatDateHuman(date))}\n\n`;
   slots.forEach((s, i) => { msg += `${i + 1}️⃣ ${s}\n`; });
@@ -286,7 +346,10 @@ function handleRescheduleChooseDate(phone, text, data) {
   const idx = parseInt(text, 10) - 1;
   if (isNaN(idx) || idx < 0 || idx >= data.dates.length) return T.invalidNumber;
   const date = data.dates[idx];
-  const slots = generateSlotsForDate(date, data.bookingId);
+  const booking = store.getBookingById(data.bookingId);
+  const service = booking ? store.getServiceById(booking.service_id) : null;
+  const duration = service ? service.duration_min : config.slotStepMinutes;
+  const slots = generateSlotsForDate(date, duration, data.bookingId);
   if (slots.length === 0) return T.noSlots(formatDateHuman(date));
   let msg = `${T.rescheduleChooseTime(formatDateHuman(date))}\n\n`;
   slots.forEach((s, i) => { msg += `${i + 1}️⃣ ${s}\n`; });
