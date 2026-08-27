@@ -215,7 +215,7 @@ function handleMenu(phone, text) {
     return msg;
   }
 
-  return `${T.notUnderstood}\n\n` + T.welcome(config.businessName);
+  return T.welcome(config.businessName);
 }
 
 function handleQuickCancel(phone, text, data) {
