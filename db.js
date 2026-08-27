@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS conversation_state (
   step TEXT,
   data TEXT   -- JSON строка с данными текущего диалога
 );
+
+CREATE TABLE IF NOT EXISTS user_lang (
+  phone TEXT PRIMARY KEY,
+  lang TEXT
+);
 `);
 
 // --- Услуги по умолчанию (мастер сможет поменять) ---
@@ -52,6 +57,18 @@ module.exports = {
 
   getServiceById(id) {
     return db.prepare('SELECT * FROM services WHERE id = ?').get(id);
+  },
+
+  getUserLang(phone) {
+    const row = db.prepare('SELECT lang FROM user_lang WHERE phone = ?').get(phone);
+    return row ? row.lang : null;
+  },
+
+  setUserLang(phone, lang) {
+    db.prepare(`
+      INSERT INTO user_lang (phone, lang) VALUES (?, ?)
+      ON CONFLICT(phone) DO UPDATE SET lang = excluded.lang
+    `).run(phone, lang);
   },
 
   getState(phone) {
@@ -98,6 +115,14 @@ module.exports = {
       WHERE phone = ? AND status = 'confirmed' AND date >= date('now')
       ORDER BY date, time
     `).all(phone);
+  },
+
+  getBookingById(id) {
+    return db.prepare('SELECT * FROM bookings WHERE id = ?').get(id);
+  },
+
+  updateBookingDateTime(id, date, time) {
+    db.prepare('UPDATE bookings SET date = ?, time = ? WHERE id = ?').run(date, time, id);
   },
 
   cancelBooking(id) {
