@@ -64,8 +64,38 @@ async function checkReminders() {
   }
 }
 
+async function checkWinback() {
+  if (!isConfigured()) return;
+
+  const bookings = store.getBookingsForWinback();
+
+  for (const b of bookings) {
+    // Не беспокоим тех, кто уже записался снова
+    const upcoming = store.getUpcomingBookingsByPhone(b.phone);
+    if (upcoming.length > 0) {
+      store.markWinbackSent(b.id);
+      continue;
+    }
+
+    const text =
+      `👋 Cześć! Minął miesiąc od Twojej ostatniej wizyty w *${config.businessName}* 💇\n\n` +
+      `Może czas na odświeżenie fryzury? Napisz "menu", żeby się szybko umówić 😊`;
+
+    try {
+      await sendMessage(b.phone, text);
+      store.markWinbackSent(b.id);
+      console.log(`[winback] Отправлено ${b.phone}`);
+    } catch (err) {
+      console.error(`[winback] Ошибка для ${b.phone}:`, err.message);
+    }
+  }
+}
+
 // Проверяем каждые 15 минут — так оба напоминания (24ч и 2ч) срабатывают
 // достаточно точно, без отдельного процесса на каждую запись
 cron.schedule('*/15 * * * *', checkReminders);
 
-module.exports = { checkReminders };
+// Win-back проверяем раз в день — этого достаточно, месяц это не срочный интервал
+cron.schedule('0 11 * * *', checkWinback);
+
+module.exports = { checkReminders, checkWinback };
