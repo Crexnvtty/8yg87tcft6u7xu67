@@ -54,7 +54,17 @@ if (seedServices.c === 0) {
   insert.run('Strzyżenie damskie długie', 60, '130 zł');
   insert.run('Strzyżenie męskie', 30, '50 zł');
   insert.run('Modelowanie włosów', 30, '80 zł');
-  insert.run('Koloryzacja (odrosty)', 110, '190 zł');
+  insert.run('Koloryzacja (farbowanie odrostów)', 110, '190 zł');
+  insert.run('Przedłużanie włosów', 240, '1200 zł');
+  insert.run('Balejaż', 240, 'cena do ustalenia');
+  insert.run('Farbowanie (wyjście z ciemności)', 480, '1200 zł');
+  insert.run('Przekłucie uszu', 10, '100 zł');
+  insert.run('Kręcenia włosów', 90, '220 zł');
+  insert.run('Sombre', 210, '550 zł');
+  insert.run('Odbudowa włosów', 90, '200 zł');
+  insert.run('Farbowanie włosów na całej długości', 120, 'cena do ustalenia');
+  insert.run('Odbudowa suchych, zniszczonych włosów', 80, '250 zł');
+  insert.run('Refleksy koloryzacja', 180, '280 zł');
 }
 
 // --- Рабочие часы (мастер может поменять в config.js) ---
