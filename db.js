@@ -1,191 +1,420 @@
-const Database = require('better-sqlite3');
-const path = require('path');
+const store = require('./db');
+const config = require('./config');
+const { sendMessage } = require('./greenApi');
+const adminLogic = require('./adminLogic');
 
-const db = new Database(path.join(__dirname, 'bookings.db'));
-db.pragma('journal_mode = WAL');
+// ---------- Тексты (только польский, для клиента) ----------
 
-// --- Схема ---
-db.exec(`
-CREATE TABLE IF NOT EXISTS services (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  duration_min INTEGER NOT NULL,
-  price TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS bookings (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  phone TEXT NOT NULL,
-  client_name TEXT,
-  service_id INTEGER,
-  date TEXT NOT NULL,      -- YYYY-MM-DD
-  time TEXT NOT NULL,      -- HH:MM
-  status TEXT DEFAULT 'confirmed', -- confirmed | cancelled
-  reminder_sent INTEGER DEFAULT 0,     -- напоминание за 24ч
-  reminder_2h_sent INTEGER DEFAULT 0,  -- напоминание за 2ч
-  created_at TEXT DEFAULT (datetime('now')),
-  FOREIGN KEY (service_id) REFERENCES services(id)
-);
-
-CREATE TABLE IF NOT EXISTS conversation_state (
-  phone TEXT PRIMARY KEY,
-  step TEXT,
-  data TEXT   -- JSON строка с данными текущего диалога
-);
-
-CREATE TABLE IF NOT EXISTS user_lang (
-  phone TEXT PRIMARY KEY,
-  lang TEXT
-);
-`);
-
-// Миграция: если база уже существовала до добавления reminder_2h_sent — добавляем столбец
-try {
-  db.exec('ALTER TABLE bookings ADD COLUMN reminder_2h_sent INTEGER DEFAULT 0');
-} catch (e) {
-  // столбец уже существует — это нормально, ничего не делаем
-}
-
-// Миграция: столбец для отметки об отправке напоминания "вернись через месяц"
-try {
-  db.exec('ALTER TABLE bookings ADD COLUMN winback_sent INTEGER DEFAULT 0');
-} catch (e) {
-  // столбец уже существует — это нормально, ничего не делаем
-}
-
-// --- Услуги по умолчанию (мастер сможет поменять) ---
-const seedServices = db.prepare('SELECT COUNT(*) as c FROM services').get();
-if (seedServices.c === 0) {
-  const insert = db.prepare('INSERT INTO services (name, duration_min, price) VALUES (?, ?, ?)');
-  insert.run('Strzyżenie damskie krótkie', 60, '90 zł');
-  insert.run('Strzyżenie damskie długie', 60, '130 zł');
-  insert.run('Strzyżenie męskie', 30, '50 zł');
-  insert.run('Modelowanie włosów', 30, '80 zł');
-  insert.run('Koloryzacja (farbowanie odrostów)', 110, '190 zł');
-  insert.run('Przedłużanie włosów', 240, '1200 zł');
-  insert.run('Balejaż', 240, 'cena do ustalenia');
-  insert.run('Farbowanie (wyjście z ciemności)', 480, '1200 zł');
-  insert.run('Przekłucie uszu', 10, '100 zł');
-  insert.run('Kręcenia włosów', 90, '220 zł');
-  insert.run('Sombre', 210, '550 zł');
-  insert.run('Odbudowa włosów', 90, '200 zł');
-  insert.run('Farbowanie włosów na całej długości', 120, 'cena do ustalenia');
-  insert.run('Odbudowa suchych, zniszczonych włosów', 80, '250 zł');
-  insert.run('Refleksy koloryzacja', 180, '280 zł');
-}
-
-// --- Рабочие часы (мастер может поменять в config.js) ---
-module.exports = {
-  db,
-
-  getServices() {
-    return db.prepare('SELECT * FROM services').all();
-  },
-
-  getServiceById(id) {
-    return db.prepare('SELECT * FROM services WHERE id = ?').get(id);
-  },
-
-  getUserLang(phone) {
-    const row = db.prepare('SELECT lang FROM user_lang WHERE phone = ?').get(phone);
-    return row ? row.lang : null;
-  },
-
-  setUserLang(phone, lang) {
-    db.prepare(`
-      INSERT INTO user_lang (phone, lang) VALUES (?, ?)
-      ON CONFLICT(phone) DO UPDATE SET lang = excluded.lang
-    `).run(phone, lang);
-  },
-
-  getState(phone) {
-    const row = db.prepare('SELECT * FROM conversation_state WHERE phone = ?').get(phone);
-    if (!row) return { step: 'menu', data: {} };
-    return { step: row.step, data: JSON.parse(row.data || '{}') };
-  },
-
-  setState(phone, step, data = {}) {
-    db.prepare(`
-      INSERT INTO conversation_state (phone, step, data) VALUES (?, ?, ?)
-      ON CONFLICT(phone) DO UPDATE SET step = excluded.step, data = excluded.data
-    `).run(phone, step, JSON.stringify(data));
-  },
-
-  resetState(phone) {
-    db.prepare('DELETE FROM conversation_state WHERE phone = ?').run(phone);
-  },
-
-  getBookingsForDate(date) {
-    return db.prepare("SELECT * FROM bookings WHERE date = ? AND status = 'confirmed'").all(date);
-  },
-
-  createBooking({ phone, client_name, service_id, date, time }) {
-    const info = db.prepare(`
-      INSERT INTO bookings (phone, client_name, service_id, date, time)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(phone, client_name, service_id, date, time);
-    return info.lastInsertRowid;
-  },
-
-  getAllUpcomingBookings() {
-    return db.prepare(`
-      SELECT * FROM bookings
-      WHERE status = 'confirmed' AND date >= date('now')
-      ORDER BY date, time
-      LIMIT 30
-    `).all();
-  },
-
-  getUpcomingBookingsByPhone(phone) {
-    return db.prepare(`
-      SELECT * FROM bookings
-      WHERE phone = ? AND status = 'confirmed' AND date >= date('now')
-      ORDER BY date, time
-    `).all(phone);
-  },
-
-  getBookingById(id) {
-    return db.prepare('SELECT * FROM bookings WHERE id = ?').get(id);
-  },
-
-  updateBookingDateTime(id, date, time) {
-    db.prepare('UPDATE bookings SET date = ?, time = ? WHERE id = ?').run(date, time, id);
-  },
-
-  cancelBooking(id) {
-    db.prepare("UPDATE bookings SET status = 'cancelled' WHERE id = ?").run(id);
-  },
-
-  // Все подтверждённые записи на ближайшие пару дней — для проверки напоминаний
-  // Записи ровно месяц назад (30 дней), для которых ещё не слали "возвращайся"
-  getBookingsForWinback() {
-    return db.prepare(`
-      SELECT * FROM bookings
-      WHERE status = 'confirmed'
-        AND winback_sent = 0
-        AND date = date('now', '-30 days')
-    `).all();
-  },
-
-  markWinbackSent(id) {
-    db.prepare('UPDATE bookings SET winback_sent = 1 WHERE id = ?').run(id);
-  },
-
-  getBookingsForReminderCheck() {
-    return db.prepare(`
-      SELECT * FROM bookings
-      WHERE status = 'confirmed'
-        AND date >= date('now')
-        AND date <= date('now', '+2 days')
-        AND (reminder_sent = 0 OR reminder_2h_sent = 0)
-    `).all();
-  },
-
-  markReminder24hSent(id) {
-    db.prepare('UPDATE bookings SET reminder_sent = 1 WHERE id = ?').run(id);
-  },
-
-  markReminder2hSent(id) {
-    db.prepare('UPDATE bookings SET reminder_2h_sent = 1 WHERE id = ?').run(id);
-  },
+const T = {
+  welcome: (name) =>
+    `👋 Dzień dobry! Pomogę Ci umówić wizytę w *${name}* — szybko, bez dzwonienia.\n\n` +
+    `1️⃣ Umów wizytę\n` +
+    `2️⃣ Moje wizyty\n` +
+    `3️⃣ Anuluj wizytę\n\n` +
+    `_Wyślij cyfrę. Napisz "menu", aby tu wrócić._\n\n` +
+    `📞 W sprawach niestandardowych: ${config.contactPhoneDisplay}`,
+  chooseService: '💈 *Wybierz usługę:*',
+  sendNumber: '_Wyślij numer z listy_',
+  notUnderstood: 'Nie zrozumiałam 🙂',
+  invalidNumber: 'Proszę wysłać numer z listy powyżej.',
+  chooseDate: '📆 *Wybierz datę:*',
+  noSlots: (d) => `Niestety, na ${d} nie ma wolnych terminów 😔\nWybierz inną datę (numer z listy powyżej).`,
+  chooseTime: (d) => `🕐 *Wolne godziny na ${d}:*`,
+  askName: 'Jak mam Cię zapisać? Proszę podać imię.',
+  nameTooShort: 'Proszę podać imię (minimum 2 znaki).',
+  bookingConfirmed: (service, d, time, name) =>
+    `✅ *Wizyta potwierdzona!*\n\n${service}\n${d} o ${time}\n\n` +
+    `Wyślemy przypomnienie dzień wcześniej. Do zobaczenia, ${name}! 💈\n\n` +
+    `_Napisz "menu" w dowolnym momencie, aby wrócić na początek_`,
+  myBookingsHeader: '📅 *Twoje wizyty:*',
+  noBookings: 'Nie masz jeszcze żadnych aktywnych wizyt.',
+  chooseBookingAction: '_Wyślij numer wizyty, aby ją zmienić lub anulować_',
+  bookingActionMenu: (service, d, time) =>
+    `Wizyta: ${service}\n${d} o ${time}\n\n1️⃣ Zmień termin\n2️⃣ Anuluj wizytę\n\n_Wyślij cyfrę_`,
+  cancelled: 'Wizyta anulowana ✅',
+  rescheduleChooseDate: '📆 *Wybierz nową datę:*',
+  rescheduleChooseTime: (d) => `🕐 *Wolne godziny na ${d}:*`,
+  rescheduled: (service, d, time) =>
+    `✅ *Termin zmieniony!*\n\n${service}\n${d} o ${time}\n\n_Napisz "menu", aby wrócić na początek_`,
+  pastBookingNoAction: 'Ta wizyta już minęła i nie można jej zmienić ani anulować.'
 };
+
+// ---------- Вспомогательные функции ----------
+
+function formatDateHuman(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  const days = ['nie', 'pon', 'wt', 'śr', 'czw', 'pt', 'sob'];
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  return `${dd}.${mm} (${days[d.getDay()]})`;
+}
+
+function getAvailableDates() {
+  const dates = [];
+  const today = new Date();
+  for (let i = 0; i < config.daysAheadToShow + 5 && dates.length < config.daysAheadToShow; i++) {
+    const d = new Date(today);
+    d.setDate(today.getDate() + i);
+    const weekday = d.getDay();
+    if (config.workingHours[weekday]) {
+      dates.push(d.toISOString().slice(0, 10));
+    }
+  }
+  return dates;
+}
+
+function toMinutes(hhmm) {
+  const [h, m] = hhmm.split(':').map(Number);
+  return h * 60 + m;
+}
+
+function toHHMM(totalMin) {
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+function generateSlotsForDate(dateStr, durationMin, excludeBookingId = null) {
+  const weekday = new Date(dateStr + 'T00:00:00').getDay();
+  const hours = config.workingHours[weekday];
+  if (!hours) return [];
+
+  const startMin = toMinutes(hours.start);
+  const endMin = toMinutes(hours.end);
+
+  // Занятые интервалы — записи (с учётом длительности услуги) + ручные блокировки мастера
+  const bookingIntervals = store.getBookingsForDate(dateStr)
+    .filter(b => b.id !== excludeBookingId)
+    .map(b => {
+      const svc = store.getServiceById(b.service_id);
+      const dur = svc ? svc.duration_min : config.slotStepMinutes;
+      const s = toMinutes(b.time);
+      return [s, s + dur];
+    });
+
+  const blockedIntervals = store.getBlockedSlotsForDate(dateStr)
+    .map(bl => [toMinutes(bl.start_time), toMinutes(bl.end_time)]);
+
+  const occupied = bookingIntervals.concat(blockedIntervals);
+
+  const slots = [];
+  for (let t = startMin; t + durationMin <= endMin; t += config.slotStepMinutes) {
+    const slotEnd = t + durationMin;
+    const overlaps = occupied.some(([os, oe]) => t < oe && slotEnd > os);
+    if (!overlaps) slots.push(toHHMM(t));
+  }
+  return slots;
+}
+
+function buildScheduleText() {
+  const bookings = store.getAllUpcomingBookings();
+  if (bookings.length === 0) return `📅 Записей пока нет.`;
+  let msg = `📅 *Ближайшие записи:*\n\n`;
+  let lastDate = null;
+  bookings.forEach(b => {
+    if (b.date !== lastDate) {
+      msg += `\n*${formatDateHuman(b.date)}*\n`;
+      lastDate = b.date;
+    }
+    const service = store.getServiceById(b.service_id);
+    msg += `  ${b.time} — ${b.client_name || 'без имени'} (${service ? service.name : ''})\n`;
+  });
+  return msg.trim();
+}
+
+function isPast(dateStr, timeStr) {
+  const dt = new Date(`${dateStr}T${timeStr}:00`);
+  return dt.getTime() < Date.now();
+}
+
+function isQuietHours() {
+  const { start, end } = config.adminQuietHours;
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const [sh, sm] = start.split(':').map(Number);
+  const [eh, em] = end.split(':').map(Number);
+  const startMin = sh * 60 + sm;
+  const endMin = eh * 60 + em;
+
+  if (startMin > endMin) {
+    // Интервал через полночь, например 21:00–09:00
+    return nowMin >= startMin || nowMin < endMin;
+  }
+  return nowMin >= startMin && nowMin < endMin;
+}
+
+function notifyAdmin(text) {
+  if (!config.masterChatId) return;
+  if (isQuietHours()) {
+    store.addPendingNotification(text);
+  } else {
+    sendMessage(config.masterChatId, text).catch(() => {});
+  }
+}
+
+// ---------- Основной обработчик входящего сообщения ----------
+
+function handleMessage(phone, rawText) {
+  const text = (rawText || '').trim();
+
+  // Глобальная команда "меню" — работает всегда, включая выход из админ-панели
+  if (/^(меню|menu|start|начать)$/i.test(text)) {
+    store.resetState(phone);
+    if (phone === config.masterChatId) {
+      return `Вышли из панели администратора. Напишите "admin", чтобы вернуться.`;
+    }
+    return T.welcome(config.businessName);
+  }
+
+  // Админ-панель — доступна только с номера мастера, полностью отдельная логика
+  if (phone === config.masterChatId) {
+    if (adminLogic.isAdminTrigger(text) || adminLogic.isAdminActive(phone)) {
+      return adminLogic.handleAdminMessage(phone, text);
+    }
+  }
+
+  // Админ-команда "расписание" — короткий алиас, доступна только с номера мастера
+  if (/^(расписание|график|записи|schedule)$/i.test(text) && phone === config.masterChatId) {
+    return buildScheduleText();
+  }
+
+  const { step, data } = store.getState(phone);
+
+  switch (step) {
+    case 'menu':
+      return handleMenu(phone, text);
+    case 'choose_service':
+      return handleChooseService(phone, text, data);
+    case 'choose_date':
+      return handleChooseDate(phone, text, data);
+    case 'choose_time':
+      return handleChooseTime(phone, text, data);
+    case 'ask_name':
+      return handleAskName(phone, text, data);
+    case 'my_bookings_select':
+      return handleMyBookingsSelect(phone, text, data);
+    case 'quick_cancel_select':
+      return handleQuickCancel(phone, text, data);
+    case 'booking_action':
+      return handleBookingAction(phone, text, data);
+    case 'reschedule_choose_date':
+      return handleRescheduleChooseDate(phone, text, data);
+    case 'reschedule_choose_time':
+      return handleRescheduleChooseTime(phone, text, data);
+    default:
+      store.resetState(phone);
+      return T.welcome(config.businessName);
+  }
+}
+
+function handleMenu(phone, text) {
+  if (text === '1') {
+    const services = store.getServices();
+    let msg = `${T.chooseService}\n\n`;
+    services.forEach((s, i) => {
+      msg += `${i + 1}️⃣ ${s.name} — ${s.duration_min} min, ${s.price}\n`;
+    });
+    msg += `\n${T.sendNumber}`;
+    store.setState(phone, 'choose_service', { services: services.map(s => s.id) });
+    return msg;
+  }
+
+  if (text === '2') {
+    const bookings = store.getUpcomingBookingsByPhone(phone);
+    if (bookings.length === 0) {
+      store.resetState(phone);
+      return `${T.noBookings}\n\n` + T.welcome(config.businessName);
+    }
+    let msg = `${T.myBookingsHeader}\n\n`;
+    bookings.forEach((b, i) => {
+      const service = store.getServiceById(b.service_id);
+      msg += `${i + 1}️⃣ ${formatDateHuman(b.date)} — ${b.time} — ${service ? service.name : ''}\n`;
+    });
+    msg += `\n${T.chooseBookingAction}`;
+    store.setState(phone, 'my_bookings_select', { bookingIds: bookings.map(b => b.id) });
+    return msg;
+  }
+
+  if (text === '3') {
+    const bookings = store.getUpcomingBookingsByPhone(phone);
+    if (bookings.length === 0) {
+      store.resetState(phone);
+      return `${T.noBookings}\n\n` + T.welcome(config.businessName);
+    }
+    let msg = `❌ *Którą wizytę anulować?*\n\n`;
+    bookings.forEach((b, i) => {
+      const service = store.getServiceById(b.service_id);
+      msg += `${i + 1}️⃣ ${formatDateHuman(b.date)} — ${b.time} — ${service ? service.name : ''}\n`;
+    });
+    msg += `\n${T.sendNumber}`;
+    store.setState(phone, 'quick_cancel_select', { bookingIds: bookings.map(b => b.id) });
+    return msg;
+  }
+
+  return T.welcome(config.businessName);
+}
+
+function handleQuickCancel(phone, text, data) {
+  const idx = parseInt(text, 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= data.bookingIds.length) return T.invalidNumber;
+  const booking = store.getBookingById(data.bookingIds[idx]);
+  if (!booking) {
+    store.resetState(phone);
+    return T.welcome(config.businessName);
+  }
+  const service = store.getServiceById(booking.service_id);
+  store.cancelBooking(booking.id);
+  store.resetState(phone);
+
+  notifyAdmin(
+    `⚠️ *Отмена записи*\n\n` +
+    `${booking.client_name || 'Клиент'}\n${service ? service.name : ''}\n` +
+    `${formatDateHuman(booking.date)} в ${booking.time}`
+  );
+
+  return `${T.cancelled}\n\n` + T.welcome(config.businessName);
+}
+
+function handleChooseService(phone, text, data) {
+  const idx = parseInt(text, 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= data.services.length) return T.invalidNumber;
+  const serviceId = data.services[idx];
+  const dates = getAvailableDates();
+  let msg = `${T.chooseDate}\n\n`;
+  dates.forEach((d, i) => { msg += `${i + 1}️⃣ ${formatDateHuman(d)}\n`; });
+  msg += `\n${T.sendNumber}`;
+  store.setState(phone, 'choose_date', { serviceId, dates });
+  return msg;
+}
+
+function handleChooseDate(phone, text, data) {
+  const idx = parseInt(text, 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= data.dates.length) return T.invalidNumber;
+  const date = data.dates[idx];
+  const service = store.getServiceById(data.serviceId);
+  const duration = service ? service.duration_min : config.slotStepMinutes;
+  const slots = generateSlotsForDate(date, duration);
+  if (slots.length === 0) return T.noSlots(formatDateHuman(date));
+  let msg = `${T.chooseTime(formatDateHuman(date))}\n\n`;
+  slots.forEach((s, i) => { msg += `${i + 1}️⃣ ${s}\n`; });
+  msg += `\n${T.sendNumber}`;
+  store.setState(phone, 'choose_time', { serviceId: data.serviceId, date, slots });
+  return msg;
+}
+
+function handleChooseTime(phone, text, data) {
+  const idx = parseInt(text, 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= data.slots.length) return T.invalidNumber;
+  const time = data.slots[idx];
+  store.setState(phone, 'ask_name', { serviceId: data.serviceId, date: data.date, time });
+  return T.askName;
+}
+
+function handleAskName(phone, text, data) {
+  if (!text || text.length < 2) return T.nameTooShort;
+  const service = store.getServiceById(data.serviceId);
+  store.createBooking({
+    phone, client_name: text, service_id: data.serviceId, date: data.date, time: data.time
+  });
+  store.resetState(phone);
+
+  notifyAdmin(
+    `🔔 *Новая запись!*\n\n` +
+    `${text}\n${service ? service.name : ''}\n` +
+    `${formatDateHuman(data.date)} в ${data.time}\n\n` +
+    `_Напишите "расписание" — все записи_`
+  );
+
+  return T.bookingConfirmed(service ? service.name : '', formatDateHuman(data.date), data.time, text);
+}
+
+function handleMyBookingsSelect(phone, text, data) {
+  const idx = parseInt(text, 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= data.bookingIds.length) return T.invalidNumber;
+  const bookingId = data.bookingIds[idx];
+  const booking = store.getBookingById(bookingId);
+
+  if (!booking || isPast(booking.date, booking.time)) {
+    store.resetState(phone);
+    return `${T.pastBookingNoAction}\n\n` + T.welcome(config.businessName);
+  }
+
+  const service = store.getServiceById(booking.service_id);
+  store.setState(phone, 'booking_action', { bookingId });
+  return T.bookingActionMenu(service ? service.name : '', formatDateHuman(booking.date), booking.time);
+}
+
+function handleBookingAction(phone, text, data) {
+  const booking = store.getBookingById(data.bookingId);
+  if (!booking) {
+    store.resetState(phone);
+    return T.welcome(config.businessName);
+  }
+
+  if (text === '1') {
+    // Перенос — выбираем новую дату
+    const dates = getAvailableDates();
+    let msg = `${T.rescheduleChooseDate}\n\n`;
+    dates.forEach((d, i) => { msg += `${i + 1}️⃣ ${formatDateHuman(d)}\n`; });
+    msg += `\n${T.sendNumber}`;
+    store.setState(phone, 'reschedule_choose_date', { bookingId: data.bookingId, dates });
+    return msg;
+  }
+
+  if (text === '2') {
+    const service = store.getServiceById(booking.service_id);
+    store.cancelBooking(booking.id);
+    store.resetState(phone);
+
+    notifyAdmin(
+      `⚠️ *Отмена записи*\n\n` +
+      `${booking.client_name || 'Клиент'}\n${service ? service.name : ''}\n` +
+      `${formatDateHuman(booking.date)} в ${booking.time}`
+    );
+
+    return `${T.cancelled}\n\n` + T.welcome(config.businessName);
+  }
+
+  return T.invalidNumber;
+}
+
+function handleRescheduleChooseDate(phone, text, data) {
+  const idx = parseInt(text, 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= data.dates.length) return T.invalidNumber;
+  const date = data.dates[idx];
+  const booking = store.getBookingById(data.bookingId);
+  const service = booking ? store.getServiceById(booking.service_id) : null;
+  const duration = service ? service.duration_min : config.slotStepMinutes;
+  const slots = generateSlotsForDate(date, duration, data.bookingId);
+  if (slots.length === 0) return T.noSlots(formatDateHuman(date));
+  let msg = `${T.rescheduleChooseTime(formatDateHuman(date))}\n\n`;
+  slots.forEach((s, i) => { msg += `${i + 1}️⃣ ${s}\n`; });
+  msg += `\n${T.sendNumber}`;
+  store.setState(phone, 'reschedule_choose_time', { bookingId: data.bookingId, date, slots });
+  return msg;
+}
+
+function handleRescheduleChooseTime(phone, text, data) {
+  const idx = parseInt(text, 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= data.slots.length) return T.invalidNumber;
+  const newTime = data.slots[idx];
+
+  const booking = store.getBookingById(data.bookingId);
+  const oldDate = booking.date;
+  const oldTime = booking.time;
+  const service = store.getServiceById(booking.service_id);
+
+  store.updateBookingDateTime(data.bookingId, data.date, newTime);
+  store.resetState(phone);
+
+  notifyAdmin(
+    `🔄 *Перенос записи*\n\n` +
+    `${booking.client_name || 'Клиент'}\n${service ? service.name : ''}\n` +
+    `Было: ${formatDateHuman(oldDate)} в ${oldTime}\n` +
+    `Стало: ${formatDateHuman(data.date)} в ${newTime}`
+  );
+
+  return T.rescheduled(service ? service.name : '', formatDateHuman(data.date), newTime);
+}
+
+module.exports = { handleMessage, formatDateHuman, buildScheduleText };
