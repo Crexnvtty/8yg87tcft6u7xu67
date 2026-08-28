@@ -46,6 +46,13 @@ try {
   // столбец уже существует — это нормально, ничего не делаем
 }
 
+// Миграция: столбец для отметки об отправке напоминания "вернись через месяц"
+try {
+  db.exec('ALTER TABLE bookings ADD COLUMN winback_sent INTEGER DEFAULT 0');
+} catch (e) {
+  // столбец уже существует — это нормально, ничего не делаем
+}
+
 // --- Услуги по умолчанию (мастер сможет поменять) ---
 const seedServices = db.prepare('SELECT COUNT(*) as c FROM services').get();
 if (seedServices.c === 0) {
@@ -150,6 +157,20 @@ module.exports = {
   },
 
   // Все подтверждённые записи на ближайшие пару дней — для проверки напоминаний
+  // Записи ровно месяц назад (30 дней), для которых ещё не слали "возвращайся"
+  getBookingsForWinback() {
+    return db.prepare(`
+      SELECT * FROM bookings
+      WHERE status = 'confirmed'
+        AND winback_sent = 0
+        AND date = date('now', '-30 days')
+    `).all();
+  },
+
+  markWinbackSent(id) {
+    db.prepare('UPDATE bookings SET winback_sent = 1 WHERE id = ?').run(id);
+  },
+
   getBookingsForReminderCheck() {
     return db.prepare(`
       SELECT * FROM bookings
