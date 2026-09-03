@@ -54,6 +54,18 @@ CREATE TABLE IF NOT EXISTS blocked_slots (
 );
 `);
 
+// Защита от одновременной записи на один и тот же слот.
+// Индекс частичный — блокирует только активные (confirmed) записи,
+// отменённые слот не занимают и не мешают новой брони.
+// Если в базе уже есть конфликтующие confirmed-записи на один date+time,
+// создание индекса упадёт с ошибкой — тогда нужно сначала вручную
+// разрешить конфликт (отменить/перенести одну из записей).
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_slot
+  ON bookings(date, time)
+  WHERE status = 'confirmed';
+`);
+
 // Миграция: столбец active для услуг (чтобы можно было "удалять" услугу, не теряя историю записей)
 try {
   db.exec('ALTER TABLE services ADD COLUMN active INTEGER DEFAULT 1');
@@ -176,12 +188,24 @@ module.exports = {
     return db.prepare("SELECT * FROM bookings WHERE date = ? AND status = 'confirmed'").all(date);
   },
 
+  // Возвращает { success: true, id } при успехе или
+  // { success: false, reason: 'slot_taken' }, если между проверкой
+  // свободных слотов и этой вставкой кто-то другой уже занял тот же
+  // date+time (гонка запросов). Уникальный индекс idx_unique_active_slot
+  // гарантирует, что база физически не пропустит дубликат.
   createBooking({ phone, client_name, service_id, date, time }) {
-    const info = db.prepare(`
-      INSERT INTO bookings (phone, client_name, service_id, date, time)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(phone, client_name, service_id, date, time);
-    return info.lastInsertRowid;
+    try {
+      const info = db.prepare(`
+        INSERT INTO bookings (phone, client_name, service_id, date, time)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(phone, client_name, service_id, date, time);
+      return { success: true, id: info.lastInsertRowid };
+    } catch (e) {
+      if (e.code && e.code.startsWith('SQLITE_CONSTRAINT')) {
+        return { success: false, reason: 'slot_taken' };
+      }
+      throw e;
+    }
   },
 
   getAllUpcomingBookings() {
@@ -205,15 +229,23 @@ module.exports = {
     return db.prepare('SELECT * FROM bookings WHERE id = ?').get(id);
   },
 
+  // Возвращает { success: true } при успехе или
+  // { success: false, reason: 'slot_taken' }, если новый date+time
+  // уже занят другой активной записью (гонка запросов при переносе).
   updateBookingDateTime(id, date, time) {
-    // Сбрасываем флаги напоминаний — иначе после переноса клиент может
-    // не получить 24ч/2ч напоминание на НОВОЕ время, если оно уже было
-    // отправлено на старое
-    db.prepare(`
-      UPDATE bookings
-      SET date = ?, time = ?, reminder_sent = 0, reminder_2h_sent = 0
-      WHERE id = ?
-    `).run(date, time, id);
+    try {
+      db.prepare(`
+        UPDATE bookings
+        SET date = ?, time = ?, reminder_sent = 0, reminder_2h_sent = 0
+        WHERE id = ?
+      `).run(date, time, id);
+      return { success: true };
+    } catch (e) {
+      if (e.code && e.code.startsWith('SQLITE_CONSTRAINT')) {
+        return { success: false, reason: 'slot_taken' };
+      }
+      throw e;
+    }
   },
 
   cancelBooking(id) {
